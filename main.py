@@ -4,6 +4,9 @@ import matplotlib.pyplot as py_plot
 import tkinter
 from tkinter import filedialog
 from pathlib import Path
+import pint
+import sys
+import skrf
 
 """  -----------------------------------  Module context items ----------------------------------------------------  """
 
@@ -11,7 +14,9 @@ totally_tabular_logging_flag = True
 totally_tabular_logging_method = print
 
 
+
 def log(text_in: str):
+
     """ a method for logging info in the tabular library and a really good reason to not use import * when importing
     this library """
     if totally_tabular_logging_flag is True:
@@ -57,8 +62,8 @@ def log(text_in: str):
 
 
 class TabularFile:
-    def __init__(self, file_path: str):
-        self._file_path = file_path
+    def __init__(self):
+        self._file_path = None
         self._file_header_rows = []    # a list of the file header lines as defined by the header line tags
         self._column_headers = []
         self._valid_column_headers = False
@@ -66,6 +71,7 @@ class TabularFile:
         self._header_line_tags = set()
         self.row_index_list = []    # in a plot these are the X values
         self.data_columns = []  # list of lists, each list is a column
+        self._column_units = []  # list of units, lets try to use pint units, for some files this will not be known
         self.column_seperator = '\t'  # tab in interpreted as whitespace so .split() is called on each row
 
     def _extract_header(self):
@@ -155,17 +161,21 @@ class TabularFile:
     def parse_data_line(self, column_vertical_index: int, row_of_data: list):
         """ the default method uses the item at position 0 as the index and the rest of the items are columns"""
         for column_list, data in zip(self.data_columns, row_of_data):    # type: list, str
-            column_list[column_vertical_index] = float(data)
+            if '!' in data:  # it is legal to add more comment rows in the data block for some reason
+                self._column_headers.extend(data)   # if more comment rows are found, add them to the header
+            else:
+                column_list[column_vertical_index] = float(data)
 
-    def load_data_into_memory(self):
+    def read_file(self, file_path: str):
         """ reads the file into memory, it exists in python as a list of lists. Also loads metadata from the headeer
         if there is any """
+        self._file_path = file_path
         self._extract_header()
         self._extract_data()
 
-    def read_into_pandas_dataframe(self):
+    def read_into_pandas_dataframe(self, file_path: str):
         """  reads the file into a pandas dataframe, clears the data from this class and returns the data frame"""
-        self.load_data_into_memory()
+        self.read_file(file_path)
         # the index will be the frequency so grab that
         index_name = self._column_headers[0]
         index_values = self.data_columns[0]
@@ -226,22 +236,74 @@ class TabularFile:
 
 
 class SNPFile(TabularFile):
-    def __init__(self, file_path: str):
-        super().__init__(file_path)
+    """ a class for reading working wth sNp or Touchstone files more info here;
+
+    https://ibis.org/touchstone_ver2.0/touchstone_ver2_0.pdf
+
+    Note that this class does not implement all features outlined in the specification """
+    def __init__(self):
+        super().__init__()
         self._frequency_units = None
         self._parameter = None
         self._format = None
         self._impedance = None
         self._valid_params = False
         self.header_line_tags = {'!', '#'}
+        self._valid_colum_headers = False
+        self._n_port_count = None    # the number of ports
+
+    def read_file(self, file_path: str):
+        path = Path(file_path)
+        self._n_port_count = int(path.suffix[2])     # suffix looks like: '.s2p'
+        log(f'Port Count: "{self._n_port_count}"')
+        if self._n_port_count > 2:
+            raise Exception(f'Not implemented for "{self._n_port_count}" port files')
+        super().read_file(file_path)
 
     def parse_header(self):
         # find the params
         for line in self.file_header_rows:  # type: str
             if '#' in line:
                 self._snp_find_options(line)
-            if 'freq' in line.lower():
+            if 's11' in line.lower():   # need to find something that is common to the column headers
                 self._snp_find_colum_headers(line)
+        if self._valid_colum_headers is False:
+            # file probably does not have headers, need to generate them now
+            prfx = self._parameter
+            if prfx is not None:
+                # need to make a header that is similar to [frequency, magS11, angS11, ... magSnn, angSnn]
+                """ specifies the format of the network parameter data pairs. Legal values are:
+                    DB for decibel-angle (decibel = 20 × log10|magnitude|)
+                    MA for magnitude-angle,
+                    RI for real-imaginary.
+                    Angles are given in degrees. Note that this format does not apply to noise
+                    parameters (refer to the “Noise Parameter Data” section later in this
+                    specification). The default value is MA. 
+                    """
+                port_list = [val for val in range(1, self._n_port_count+1)]
+                header_list_pre = []
+                for port_a in port_list:
+                    for port_b in port_list:
+                        header_list_pre.append(f'{prfx}{port_b}{port_a}')
+                l_case_format = self._format.lower()
+                if l_case_format == 'db':
+                    u1 = 'dBm'
+                    u2 = 'ang'
+                elif l_case_format == 'ma':
+                    u1 = 'mag'
+                    u2 = 'ang'
+                elif l_case_format == 'ri':
+                    u1 = 're'
+                    u2 = 'im'
+                else:
+                    raise Exception(f'cant determine column names from format: "{l_case_format}" ')
+                log(f'header list pre: "{header_list_pre}"')
+                final_header = [f'{self._frequency_units}']
+                for item in header_list_pre:
+                    final_header.extend([f'{u1}{item}', f'{u2}{item}'])
+                log(f'header list final: "{final_header}"')
+                self._column_headers = final_header
+
 
     def _snp_find_options(self, row_in: str):
         """
@@ -289,16 +351,21 @@ class SNPFile(TabularFile):
     def _snp_find_colum_headers(self, row_in: str):
         row_sections = row_in.split()
         removed_line_start_char = row_sections.pop(0)
+        if len(removed_line_start_char) > 1:    # sometimes there is no space after the !
+            row_sections.insert(0, f'{removed_line_start_char[1:]}')
         if len(row_sections) > 1:   # for clearing empty comment lines
             # if row_sections[1] == '':   # remove extra spaces
             #     row_sections = [item for item in row_sections if item != '']
             if len(row_sections) > 1:  # for clearing empty comment lines
                 first = row_sections.pop(0).lower()
-                if 'freq' in first:   # this is good, its probably the header
+                if 'f' in first.lower():   # this is good, its probably the header typical is: f, F, freq
                     self._column_headers = [f'Frequency {self._frequency_units}']
                     for section in row_sections:
                         self._column_headers.append(section)
                     self._valid_colum_headers = True
+
+    def get_mag_db_re_column_names(self):
+        """ Since the format can be in DB MA or RI this method returns the colum names for D, M, or R respectively """
 
     # def read_snp_file(self, n=2):
     #     if n == 2:
@@ -346,12 +413,24 @@ def request_user_select_file(win_title='please select a file'):
 
 if __name__ == '__main__':
 
-    file_path_str = request_user_select_file()
+    # file_path_str = request_user_select_file()
+    file_path_str = f'/Users/joeeveryman/PycharmProjects/scikit-rf/skrf/tests/ntwk_arbitrary_frequency.s2p'
     if file_path_str is not None:
-        file = SNPFile(file_path_str)
-        frame = file.read_into_pandas_dataframe()
-        frame.plot(y=['magS11', 'magS21', 'magS22', 'magS12'])
+        # file = SNPFile()
+        # frame = file.read_into_pandas_dataframe(file_path_str)
+        # column_tag = 'res'
+        # columns_to_plot = [item for item in file.column_headers if column_tag in item.lower()]
+        # frame.plot(y=columns_to_plot)
+        # py_plot.show()
+
+        open_file = open(file_path_str)
+        scikit_snp_file = skrf.Touchstone(file_path_str)
+        scikit_snp_file.load_file(open_file)
+        rf_net_a = skrf.Network(file_path_str)
+        net_data_frame = skrf.network_2_dataframe(rf_net_a, )   # type: pandas.DataFrame
+        net_data_frame.plot(y=net_data_frame.columns)
         py_plot.show()
+        log(f'here')
 
     # file.read_snp_file(2)
 
